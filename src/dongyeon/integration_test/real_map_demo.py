@@ -75,6 +75,12 @@ if FLUID and WATER:
 STEPS = 60000
 if "--steps" in sys.argv:
     STEPS = int(sys.argv[sys.argv.index("--steps") + 1])
+# --ros: pipe_comm 규약(src/dongmin/pipe_comm/pipe_comm/contract.py) 브리지.
+#        web_panel 이 보는 drive_state/odom/imu/event/rgb 를 발행한다.
+#        아래 활성카메라 발행(NO_ROS 계열, /repair_robot/active_cam/*)과는
+#        토픽이 겹치지 않는 별개 채널이라 같이 켜도 된다.
+ROS = "--ros" in sys.argv
+ROS_NS = os.environ.get("ROS_NS", "robot")
 
 from isaacsim import SimulationApp                        # noqa: E402
 
@@ -1609,6 +1615,102 @@ def _log_yolo_opinion(d_cur, tag):
     print(line)
 
 
+# ── pipe_comm 규약 브리지 (--ros 일 때만) — src/dongmin/isaac_bridge/ 단일 출처 ──
+# 🔑 카메라·annotator 가 이미 만들어졌고(`rigs`) world.reset() 도 지났다
+#    (규격서 §8.2 순서 제약). annotator 는 다시 붙이지 않고 그대로 쓴다.
+# 🚨 src/son 은 sys.path 에 **append** 로 넣는다 — 이 사본에도 condition/
+#    welder 등 같은 이름의 패키지가 있어서 앞에 끼우면 남의 모듈을 잡는다.
+bridge = None
+if ROS:
+    # 🔑 발행자는 규약 옆에 있다 — `src/dongmin/isaac_bridge/`
+    #    (2026-08-08 `src/son` 에서 옮겼다. dongmin 코드라 dongmin 자리로).
+    sys.path.append(
+        str(_P(__file__).resolve().parents[2] / "dongmin" / "isaac_bridge"))
+    import ros_bridge                                     # noqa: E402
+    if not ros_bridge.available():
+        raise SystemExit("[중단] --ros 인데 rclpy/규약을 못 쓴다 — 실행 전 "
+                         "`isaac_ros` (LD_LIBRARY_PATH/PYTHONPATH) 확인")
+    from pipe_comm import contract                        # noqa: E402
+    bridge = ros_bridge.Bridge([ROS_NS])
+    _rp_pc = bridge.robot(ROS_NS)
+    # 카메라 3대를 각자의 토픽으로 낸다 — 웹 Camera 화면이 셋을 나란히 본다.
+    # (활성카메라 하나만 갈아 끼우는 /repair_robot/active_cam 과는 별개 채널)
+    _CAM_ROLE = {"front_camera": "front", "back_camera": "rear",
+                 "torch_camera": "torch"}
+    for _nm, _ann, _dep in rigs:
+        _role = _CAM_ROLE.get(_nm)
+        if _role is not None:
+            _rp_pc.use_annotators(_ann, _dep, CAM_W, CAM_H, F_PX, _role)
+    print(f"[ROS] pipe_comm 규약 발행 — ns={ROS_NS}, 카메라 "
+          f"{len(_rp_pc.cams)}대 "
+          f"({', '.join(c[0] for c in _rp_pc.cams)})")
+    # 🔑 셋을 다 굽지 않고 **그때 쓰는 한 대만** 발행한다(규칙은
+    #    active_camera_name). 안 켠 카메라 토픽은 정상적으로 조용하다 —
+    #    웹은 drive_state 의 `cam` 필드로 어느 것이 켜져 있는지 안다.
+    print("[ROS] 카메라 분기 — 전진 front / 후진(RETURN·RECOVER) rear / "
+          "정렬~아크(ALIGN·EXTEND·ARC) torch")
+    # 코스 기하를 latched 로 한 번 선언 — web_panel 3D 맵의 단일 출처.
+    # tabulate(ds=2mm) 표본을 20mm 간격으로 솎는다(곡관 R150 도 충분히 매끈).
+    _crs = [[float(PATH.tab_s[i]), *map(float, PATH.tab_p[i])]
+            for i in range(0, len(PATH.tab_s), 10)]
+    if _crs[-1][0] < PATH.total - 1e-6:
+        _p_end, _ = PATH.point_tangent(PATH.total)
+        _crs.append([PATH.total, *map(float, _p_end)])
+    # 🚨 z 오프셋을 같이 싣는다 — 층별로 2대를 동시에 돌릴 때 관제 3D 맵이
+    #    두 좌표계를 한 프레임으로 겹치는 데 쓴다(없으면 2.49m 어긋난다).
+    _rp_pc.publish_course(_crs, ir_m=PIPE_IR, bend_r_m=BEND_R,
+                          z_shift_mm=-Z_NET)
+    # 🔑 CAD 메시도 여기서 굽고 보낸다 — **맵 배치를 아는 것은 이쪽뿐이다.**
+    #    z 오프셋은 활성 층의 수평망을 월드 z=0 으로 올리는 값(= -Z_NET):
+    #    floor2 는 +250, floor1 은 +2740.23. 받는 쪽이 파라미터로 다시 말해
+    #    주는 구조였을 땐 층을 바꾸는 순간 건물이 2.49m 어긋났다.
+    # 🚨 웹 PC 가 다른 자리에 있으면 파일은 안 보인다 — 그래서 토픽으로 넘긴다
+    #    (0.77MB, latched 1회. 조각내기는 RTPS 가 알아서 한다).
+    _rp_pc.publish_mesh(_P(MAP_USD).with_suffix(".webmesh"),
+                        usd=MAP_USD, z_shift_mm=-Z_NET)
+    _ROS_EVERY = max(1, int(PHYSICS_HZ / 10))     # 10Hz
+    _ros_prev_state = None
+    _weld_spot = None         # 용접 순간 팁이 실제로 선 자리 (s_mm, clock_deg)
+
+    # ── 임무 지령 상태 (web_panel 의 Robot Handling 버튼이 여기로 온다) ──
+    # 🚨 **용접 시퀀스 중에는 멈추지 않는다.** 토치가 뻗고 아크가 붙은 상태로
+    #    세우면 재개 경로가 없고(로드가 관벽에 닿은 채로 대기) 위험하다.
+    #    그래서 STOP/RECALL/RETRY 는 "해 달라는 요청"으로만 들고 있다가, FSM 이
+    #    아래 **주행 상태**로 돌아오는 순간 실제로 걸린다 — 지령을 거절하지 않고
+    #    미루는 쪽이 조작하는 사람 입장에서 예측 가능하다. ESTOP 만 예외로
+    #    어느 상태에서든 그 자리에서 언다(비상정지가 미뤄지면 비상정지가 아니다).
+    _hold = False             # STOP — 재개 가능
+    _estop = False            # ESTOP — 재개 불가. 시연을 다시 띄워야 한다
+    _recall = False           # RECALL 대기 (주행 상태로 오면 RETURN 진입)
+    _forward = False          # FORWARD 대기 (복귀를 접고 다시 전진 점검)
+    _retry = False            # RETRY 대기 (주행 상태로 오면 RECOVER 진입)
+    _cmd_why = ""             # 마지막 지령의 reason — end_reason 에 싣는다
+    _HOLD_STATES = ("SETTLE", "CRUISE", "RESUME", "RETURN", "JUNCTION")
+
+    # SPEED 상한은 **물리 설정이 정한다.** contactOffset 은 스테이지를 구울 때
+    # 박히므로(실행 중 못 바꾼다) 그때 잡은 값보다 빨라지면 휠이 관벽을 뚫고
+    # 지나갈 수 있다. CONTACT_OFFSET = 1.2·v/hz 로 잡았으니 역이 상한이다.
+    SPEED_MIN_MPS = 0.005
+    SPEED_MAX_MPS = CONTACT_OFFSET * PHYSICS_HZ / 1.2
+    print(f"[ROS] 지령 구현 — START/STOP/RECALL/FORWARD/RETRY/SPEED/ESTOP "
+          f"(속도 {SPEED_MIN_MPS * 1000:.0f}~{SPEED_MAX_MPS * 1000:.0f}mm/s, "
+          f"contactOffset {CONTACT_OFFSET * 1000:.2f}mm 가 정한 상한)")
+    # 이 사본의 FSM → 규약 상태값 (RECHECK 는 이 사본에만 있는 재검 상태다)
+    _ST = {
+        "SETTLE": contract.STATE_SETTLE,
+        "CRUISE": contract.STATE_RUN, "RESUME": contract.STATE_RUN,
+        "JUNCTION": contract.STATE_RUN,
+        "INSPECT": contract.STATE_INSPECT, "VERIFY": contract.STATE_INSPECT,
+        "RECHECK": contract.STATE_INSPECT,
+        "ALIGN": contract.STATE_REPAIR, "EXTEND": contract.STATE_REPAIR,
+        "ARC": contract.STATE_REPAIR, "COOL": contract.STATE_REPAIR,
+        "RECOVER": contract.STATE_STUCK,
+        "REPOSITION": contract.STATE_RETURN, "RETURN": contract.STATE_RETURN,
+        "DISCONNECTED": contract.STATE_HOLD,
+        "DONE": contract.STATE_DONE,
+    }
+    _REVERSING = ("REPOSITION", "RECOVER", "RETURN")
+
 sys.path.insert(0, str(SON))
 from condition.detector import PipeConditionDetector      # noqa: E402
 from welder.weld import WeldSequencer                     # noqa: E402
@@ -2273,6 +2375,18 @@ def restart_demo():
     globals()['rechecked'] = False
     globals()['rod_required_mm'] = 0.0
     verdicts, end_reason, inspect_fwd_mm, _last_check = [], None, 0.0, 0
+    if bridge is not None:
+        # 🚨 지령 상태도 같이 푼다 — 안 그러면 ESTOP 을 눌러 세워 둔 채로
+        #    재시작했을 때 새 판이 시작하자마자 얼어 있고, 재개 경로가 없다.
+        #    (지령으로 바꾼 주행 속도는 **남긴다** — 설정이지 판의 상태가 아니다)
+        globals()["_hold"] = False
+        globals()["_estop"] = False
+        globals()["_recall"] = False
+        globals()["_forward"] = False
+        globals()["_retry"] = False
+        # 상태 전이 사건(START 등)을 새 판에서 다시 내보내기 위해 비운다.
+        globals()["_ros_prev_state"] = None
+        globals()["_weld_spot"] = None
     print("=" * 78)
     print("[재시작] Stop → Play 감지 — 처음부터 다시 돈다")
 
@@ -2300,6 +2414,170 @@ while True:
         cam_bridge.publish(active_camera_name(state))
         rclpy.spin_once(cam_bridge, timeout_sec=0.0)
 
+    # 🚨 **DONE 검사보다 앞에 둔다** (src/son repair_demo 실측 교훈) — 뒤에 두면
+    #    시퀀스가 끝나는 순간 발행·지령 수신(`bridge.spin()`)이 통째로 멈춘다.
+    # ── pipe_comm 규약 발행 (10Hz) — FSM 을 건드리지 않고 관찰만 한다 ──
+    if bridge:
+        if state != _ros_prev_state:
+            # 🔑 상태 전이는 **1회성 사건**으로 따로 낸다 (규격서 §7.2).
+            _ev = {"INSPECT": contract.EV_DEFECT,
+                   "ARC": contract.EV_WELD_BEGIN,
+                   "REPOSITION": contract.EV_WELD_DONE,
+                   "RECOVER": contract.EV_STUCK,
+                   "JUNCTION": contract.EV_BRANCH,
+                   "DISCONNECTED": contract.EV_DISCONNECT}.get(state)
+            if state == "CRUISE" and _ros_prev_state == "SETTLE":
+                _ev = contract.EV_START
+            if state == "DONE":
+                # 복귀 완주면 HOME, 코스 끝 도달이면 ARRIVE, 그 밖은 DONE
+                _ev = (contract.EV_HOME if _ros_prev_state == "RETURN"
+                       else contract.EV_ARRIVE
+                       if end_reason and "코스 끝" in end_reason
+                       else contract.EV_DONE)
+            if _ev:
+                # 용접 사건에는 **팁이 실제로 선 자리**(호길이·시계각)를 싣는다
+                # — 웹 3D 맵이 노란 스티커를 관 벽면에 붙인다 (extra 필드).
+                if _ev == contract.EV_WELD_BEGIN and not NO_TORCH:
+                    _tw = tip_end_world()
+                    _ts, _ = PATH.project(_tw, s_hint)
+                    _tc, _tt = PATH.point_tangent(_ts)
+                    _tv = _tw - _tc
+                    _tv = _tv - _tt * np.dot(_tv, _tt)
+                    _tn = float(np.linalg.norm(_tv))
+                    _weld_spot = (
+                        round(_ts * 1000, 1),
+                        round((PATH.clock_of(_ts, _tv / _tn) if _tn > 1e-9
+                               else (d_cur["clock"] if d_cur else 180.0))
+                              % 360.0, 1))
+                _extra = {}
+                if _ev in (contract.EV_WELD_BEGIN, contract.EV_WELD_DONE):
+                    if _weld_spot is not None:
+                        _extra = {"defect_s_mm": _weld_spot[0],
+                                  "clock_deg": _weld_spot[1]}
+                    elif d_cur is not None:
+                        # 토치 없는 시연(--no-torch) — 설계 좌표라도 싣는다
+                        _extra = {"defect_s_mm": round(d_cur["s"] * 1000, 1),
+                                  "clock_deg": round(d_cur["clock"] % 360.0, 1)}
+                bridge.robot(ROS_NS).emit(
+                    _ev, f"{_ros_prev_state} → {state}",
+                    s_of(_seg1, s_hint) * 1000, **_extra)
+            _ros_prev_state = state
+        if step % _ROS_EVERY == 0:
+            _rp_pc = bridge.robot(ROS_NS)
+            # 🔑 **지령을 먼저 꺼낸다.** 그래야 방금 누른 버튼이 바로 아래
+            #    publish_state 에 반영된다 — 안 그러면 화면의 상태가 늘 한 틱
+            #    (100ms) 늦어서 "눌렀는데 반응이 없다" 로 보인다.
+            while (_cmd := _rp_pc.pop_mission()) is not None:
+                _cc = str(_cmd.get("cmd") or "")
+                _why = str(_cmd.get("reason") or "")
+                _cmd_why = _why
+                # 🔓 비상정지 해제는 **사람이 명시적으로** 한다(규약상 ESTOP 은
+                #    "재개 불가, 사람이 푼다"). 규약에 지령을 새로 만들지 않고
+                #    START 의 reason 에 ESTOP_RELEASE 를 실어 온 것만 해제로
+                #    친다 — 실수로 ▶ 시작을 눌러서 비상정지가 풀리면 안 된다.
+                if (_estop and _cc == contract.CMD_START
+                        and "ESTOP_RELEASE" in _why.upper()):
+                    _estop = False
+                    _hold = True     # 🚨 풀어도 **바로 안 간다**. 정지 상태로
+                    print(f"[ROS] 🔓 비상정지 해제 ({state}) — 정지(HOLD)로 "
+                          f"돌아왔다. ▶ START 를 한 번 더 눌러야 움직인다")
+                elif _estop and _cc != contract.CMD_ESTOP:
+                    print(f"[ROS] 📥 {_cc} 무시 — 비상정지 상태다. "
+                          f"'🔓 비상정지 해제' 를 먼저 누를 것 "
+                          f"(START + reason=ESTOP_RELEASE)")
+                elif _cc == contract.CMD_START:
+                    if _hold:
+                        _hold = False
+                        print(f"[ROS] ▶ START — 주행 재개 ({state}) {_why}")
+                    else:
+                        print(f"[ROS] ▶ START — 이미 주행 중 ({state})")
+                elif _cc == contract.CMD_STOP:
+                    _hold = True
+                    print("[ROS] ⏸ STOP — " + (
+                        "지금 세운다" if state in _HOLD_STATES else
+                        f"{state} 시퀀스가 끝나면 선다(용접 중엔 못 세운다)"))
+                elif _cc == contract.CMD_SPEED:
+                    _v = float(_cmd.get("mps") or 0.0)
+                    _vc = min(max(_v, SPEED_MIN_MPS), SPEED_MAX_MPS)
+                    TARGET_SPEED_MPS = _vc
+                    # 🚨 휠 지령은 각속도다. SPIN_DEG_S 를 같이 갈아야 실제
+                    #    주행이 바뀐다 — TARGET_SPEED_MPS 만 바꾸면 화면의
+                    #    숫자만 변하고 로봇은 그대로 간다(조용한 거짓말).
+                    SPIN_DEG_S = math.degrees(_vc / WHEEL_R)
+                    print(f"[ROS] ⏩ SPEED {_v * 1000:.0f} → "
+                          f"{_vc * 1000:.0f}mm/s"
+                          + (" (상한/하한으로 잘림)" if abs(_vc - _v) > 1e-9
+                             else ""))
+                elif _cc == contract.CMD_RECALL:
+                    if state == "RETURN":
+                        print("[ROS] ↩ RECALL — 이미 복귀 중이다")
+                    else:
+                        # 🚨 반대 지령을 같이 지운다 — 둘 다 대기 중이면
+                        #    적용 순서 때문에 RETURN 에 들어갔다 곧바로
+                        #    CRUISE 로 튀어나온다(나중 누른 것이 이긴다).
+                        _recall, _forward, _hold = True, False, False
+                        print("[ROS] ↩ RECALL — " + (
+                            "지금 방향을 뒤집는다" if state in _HOLD_STATES
+                            else f"{state} 시퀀스가 끝나면 복귀한다"))
+                elif _cc == contract.CMD_FORWARD:
+                    # 🔑 START 로는 방향이 안 바뀐다 — 복귀 중 START 는 계속
+                    #    뒤로 간다. 앞으로 돌려세우는 것은 이 지령이다.
+                    _forward, _recall, _hold = True, False, False
+                    print("[ROS] ⏩ FORWARD — " + (
+                        "복귀를 접고 다시 전진 점검한다" if state == "RETURN"
+                        else "전진 주행 재개" if state in _HOLD_STATES
+                        else f"{state} 시퀀스가 끝나면 전진한다"))
+                elif _cc == contract.CMD_RETRY:
+                    if state == "RETURN":
+                        print("[ROS] ↻ RETRY — 복귀 중에는 안 받는다")
+                    else:
+                        _retry, _hold = True, False
+                        print("[ROS] ↻ RETRY — " + (
+                            "지금 후진해 재진입한다" if state in _HOLD_STATES
+                            else f"{state} 시퀀스가 끝나면 재시도한다"))
+                elif _cc == contract.CMD_ESTOP:
+                    _estop, _hold = True, True
+                    drive(0.0)
+                    # 아크는 즉시 끈다 — 얼어붙은 채로 계속 타면 안 된다.
+                    if arc_light is not None:
+                        arc_light.GetIntensityAttr().Set(0.0)
+                    print(f"[ROS] ⛔ ESTOP — {state} 에서 그 자리에 언다. "
+                          f"재개 불가 ({_why})")
+                    _rp_pc.emit(contract.EV_ESTOP, f"지령 비상정지 — {_why}",
+                                s_of(_seg1, s_hint) * 1000)
+                else:
+                    print(f"[ROS] 📥 모르는 지령 {_cc!r} — 무시")
+            _p = wpos(_seg1)
+            _s, _off = PATH.project(_p, s_hint)
+            # 롤 = 몸통 중심이 중심선에서 밀린 방향의 시계각 (180=바닥 규약)
+            _c, _t = PATH.point_tangent(_s)
+            _dv = _p - _c
+            _dv = _dv - _t * np.dot(_dv, _t)
+            _n = float(np.linalg.norm(_dv))
+            # 지령으로 서 있으면 **그렇게 싣는다** — FSM 이름(CRUISE)을 그대로
+            # 내면 화면에는 "주행 중" 으로 보이는데 실제로는 멈춰 있다.
+            _held = _estop or (_hold and state in _HOLD_STATES)
+            # 🔑 카메라는 **한 번에 한 대만** 켠다 — 전진이면 전방, 후진이면
+            #    후방, 정렬~아크면 토치. 분기 규칙은 활성카메라 발행
+            #    (`active_camera_name`)과 **같은 함수를 쓴다**: 규칙이 두
+            #    군데로 갈라지면 두 화면이 서로 다른 카메라를 가리킨다.
+            _cam_role = _CAM_ROLE.get(active_camera_name(state), "front")
+            _rp_pc.publish_state(
+                state=(contract.STATE_DEAD if _estop else
+                       contract.STATE_HOLD if _held else
+                       _ST.get(state, contract.STATE_RUN)),
+                direction=-1 if state in _REVERSING else 1,
+                speed_mps=TARGET_SPEED_MPS, s_mm=_s * 1000,
+                s_total_mm=PATH.total * 1000, off_mm=_off * 1000,
+                lap=0, stuck=stuck_retry, step=step,
+                roll_deg=(PATH.clock_of(_s, _dv / _n) if _n > 1e-6 else 180.0),
+                reason=(f"ESTOP({state})" if _estop else
+                        f"HOLD({state})" if _held else state),
+                art=art, wheel_idx=wheel_idx, pos=_p, cam=_cam_role)
+            _rp_pc.publish_camera(only=_cam_role)
+        # 🚨 매 스텝. 안 부르면 지령을 아예 못 받는다.
+        bridge.spin()
+
     if state == "DONE":
         if not reported:
             drive(0.0)
@@ -2324,6 +2602,66 @@ while True:
         _t_mark, _step_mark = time.time(), step
     if WATER and water_instancer is not None and step % RECYCLE_EVERY == 0:
         recycle_particles()
+
+    # ── 임무 지령 적용 — FSM 을 실제로 건드리는 **유일한** 자리 ──────────
+    # 🚨 ESTOP 은 어느 상태에서든 그 자리에서 언다. 나머지(STOP/RECALL/FORWARD/
+    #    RETRY)는
+    #    주행 상태(_HOLD_STATES)로 돌아온 순간에만 걸린다 — 용접 시퀀스를
+    #    중간에 끊으면 재개 경로가 없다(지령 수신부 주석 참고).
+    # 🔑 `continue` 로 FSM 을 통째로 건너뛴다. 위의 발행 블록은 이 자리보다
+    #    **앞**에 있으므로, 서 있는 동안에도 상태·영상은 계속 나간다.
+    if bridge and _estop:
+        drive(0.0)
+        continue
+    if bridge and state in _HOLD_STATES:
+        if _recall:
+            _recall = False
+            if state == "RETURN":
+                print("[ROS] ↩ RECALL 취소 — 이미 복귀 중이다")
+            else:
+                if state == "JUNCTION":
+                    release_pistons()      # 분기 예압을 풀고 나간다
+                drive(0.0)
+                end_reason = ("지령 복귀(RECALL)"
+                              + (f" — {_cmd_why}" if _cmd_why else ""))
+                print(f"[ROS] ↩ RECALL 적용 — {state} → RETURN "
+                      f"(진행 {s_of(_seg1) * 1000:.0f}mm)")
+                state, t_state = "RETURN", 0
+                continue
+        if _forward:
+            _forward = False
+            if state == "RETURN":
+                drive(0.0)
+                # 🚨 결함 플래그를 **되돌린다.** 안 그러면 `rechecked` 가 남아
+                #    있어서 CRUISE 가 RECHECK 를 건너뛰고 바로 ALIGN 으로 간다
+                #    — 용접봉 잔량 검사(§8.3)가 RECHECK 안에 있으므로, 소진
+                #    때문에 복귀했던 경우 검사 없이 그대로 용접해 버린다.
+                inspected, rechecked = False, False
+                pre_hole, pre_bead = None, None
+                # 복귀 사유(단절·소진)는 여기서 끝난다. 남겨 두면 보고서가
+                # 이번 판을 그 사유로 끝난 것처럼 적는다.
+                end_reason = None
+                _nxt = (f"결함 {cur + 1}(s {DEFECTS[cur]['s'] * 1000:.0f}mm)"
+                        if cur < len(DEFECTS) else "남은 결함 없음 — 코스 끝까지")
+                print(f"[ROS] ⏩ FORWARD 적용 — RETURN → CRUISE, 다시 전진 "
+                      f"점검한다 (진행 {s_of(_seg1) * 1000:.0f}mm, 다음 {_nxt})")
+                state, t_state = "CRUISE", 0
+                continue
+            print(f"[ROS] ⏩ FORWARD 적용 — {state} 에서 전진 주행 재개")
+        if _retry:
+            _retry = False
+            if state == "RETURN":
+                print("[ROS] ↻ RETRY 취소 — 복귀 중에는 안 받는다")
+            else:
+                if state == "JUNCTION":
+                    release_pistons()
+                drive(0.0)
+                print(f"[ROS] ↻ RETRY 적용 — {state} → RECOVER (후진 재진입)")
+                state, t_state = "RECOVER", 0
+                continue
+        if _hold:
+            drive(0.0)
+            continue
 
     t_state += 1
     s_hint = s_of(_seg1)
@@ -3039,6 +3377,18 @@ while True:
 
 if not reported:
     report()
+
+# 🔑 아래 cam_bridge 블록이 rclpy.shutdown() 까지 하므로 여기서는 노드만
+#    정리한다(이중 shutdown 방지). cam_bridge 가 없으면 여기서 끝낸다.
+if bridge is not None:
+    print(f"[ROS] pipe_comm 규약 발행 종료 — 영상 "
+          f"{sum(p.n_img for p in bridge.pubs.values())}장")
+    bridge.node.destroy_node()
+    if cam_bridge is None:
+        try:
+            bridge._rclpy.shutdown()
+        except Exception:
+            pass
 
 if cam_bridge is not None:
     print(f"[종료] ROS2 활성 카메라 발행 — 총 {cam_bridge.n} 프레임")

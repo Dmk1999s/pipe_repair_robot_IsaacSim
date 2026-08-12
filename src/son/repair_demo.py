@@ -134,6 +134,12 @@ if FLUID and WATER:
 STEPS = 9000
 if "--steps" in sys.argv:
     STEPS = int(sys.argv[sys.argv.index("--steps") + 1])
+# --ros: 규약(`src/dongmin/pipe_comm/pipe_comm/contract.py`)대로 ROS 2 로
+# 내보낸다. 🚨 **기본은 꺼져 있다** — 안 주면 이 시연은 예전과 한 글자도 다르게
+# 동작하지 않는다. 통신 때문에 검증된 시퀀스가 흔들리면 안 된다.
+ROS = "--ros" in sys.argv
+# 네임스페이스. 로봇이 한 대라 기본은 규약의 `/robot` 이다.
+ROS_NS = os.environ.get("ROS_NS", "robot")
 
 from isaacsim import SimulationApp                        # noqa: E402
 
@@ -1109,6 +1115,81 @@ if True:
         rigs = []
 
 
+# ── ROS 2 브리지 (--ros 일 때만) ────────────────────────────────────
+# 🔑 여기가 붙일 자리다 — 카메라·annotator 가 이미 만들어졌고(`rigs`),
+#    `world.reset()` 도 지났다. 규격서 §8.2 의 순서 제약을 만족한다.
+bridge = None
+if ROS:
+    # 🔑 발행자는 규약 옆 — src/dongmin/isaac_bridge (2026-08-08 이동)
+    sys.path.insert(0, str(SON.parent / "dongmin" / "isaac_bridge"))
+    import ros_bridge                                       # noqa: E402
+    if not ros_bridge.available():
+        raise SystemExit("[중단] --ros 인데 rclpy/규약을 못 쓴다. "
+                         "`isaac_ros` 를 먼저 실행할 것")
+    from pipe_comm import contract                          # noqa: E402
+    bridge = ros_bridge.Bridge([ROS_NS])
+    _rp = bridge.robot(ROS_NS)
+    # 🔑 **이미 붙어 있는 annotator 를 그대로 쓴다.** 다시 붙이면 검출 코드와
+    #    다른 프레임을 볼 수 있어 로그 대조가 안 된다.
+    for _nm, _ann, _dep in rigs:
+        if _nm == "front_camera":
+            _rp.use_annotators(_ann, _dep, CAM_W, CAM_H, F_PX)
+    print(f"[ROS] 전방 카메라 annotator {len(_rp.cams)}개 연결")
+    _ROS_EVERY = max(1, int(PHYSICS_HZ / 10))     # 10Hz
+    _weld_spot = None         # 용접 순간 팁이 실제로 선 자리 (s_mm, clock_deg)
+    # repair_demo FSM → 규약 상태값. 규약이 더 넓으므로 여기서 좁혀 준다.
+    # 🚨 실제 상태는 소스에서 뽑은 것이다(`state, t_state = "..."`):
+    #    SETTLE APPROACH INSPECT ALIGN EXTEND ARC COOL REPOSITION VERIFY
+    #    RESUME DONE.  머리말 시퀀스의 `SWAP`/`RETRACT` 는 **상태가 아니라
+    #    로그 이름**이라 매핑에 넣으면 영영 안 걸린다(첫 판에서 그래서
+    #    WELD_DONE 이 한 번도 안 나갔다).
+    _ST = {
+        "SETTLE": contract.STATE_SETTLE,
+        "APPROACH": contract.STATE_RUN, "RESUME": contract.STATE_RUN,
+        "INSPECT": contract.STATE_INSPECT, "VERIFY": contract.STATE_INSPECT,
+        "ALIGN": contract.STATE_REPAIR, "EXTEND": contract.STATE_REPAIR,
+        "ARC": contract.STATE_REPAIR, "COOL": contract.STATE_REPAIR,
+        "REPOSITION": contract.STATE_RETURN,
+        "DONE": contract.STATE_DONE,
+    }
+
+
+# 입구 직관 시작 x (usda 정점 실측 −0.350). s=0 의 기준점이다.
+PIPE_X0 = -0.350
+PIPE_S_TOTAL = (0.0 - PIPE_X0) + ARC_R * math.pi / 2 + 0.350
+
+
+def pipe_s(p):
+    """월드 좌표 → **관 중심선을 따라 잰 진행거리 s (m)**.
+
+    🚨 직선거리가 아니다. 규격서 §6.4 — `odom.pose.position.x` 에 이 값을
+       싣는다. 직선거리를 쓰면 곡관에서 위치가 뒤로 가는 것처럼 보인다.
+
+    코스(`pipe/pipe_elbow_lr150.usda`) 기하는 이 파일 상수와 같다:
+        입구 직관  y=IN_Y(−0.150), x: X0 → 0        (+X 진행)
+        곡관       중심 (0,0), R=ARC_R(0.150), 90°
+        출구 직관  x=OUT_X(+0.150), y: 0 → …        (+Y 진행)
+    """
+    x, y = float(p[0]), float(p[1])
+    if x <= 0.0 and y <= IN_Y * 0.5:          # 입구 직관
+        return x - PIPE_X0
+    if x >= OUT_X * 0.99 and y >= 0.0:        # 출구 직관
+        return (0.0 - PIPE_X0) + ARC_R * math.pi / 2 + y
+    # 곡관 — (0,−R) 에서 (R,0) 으로 가는 사분원. t = atan2(x, −y)
+    t = math.atan2(max(x, 0.0), max(-y, 0.0))
+    return (0.0 - PIPE_X0) + ARC_R * min(max(t, 0.0), math.pi / 2)
+
+
+def pipe_off(p):
+    """중심선에서 벗어난 거리 (m). 관 내반경 0.050 을 넘으면 관 밖이다."""
+    x, y, z = float(p[0]), float(p[1]), float(p[2])
+    if x <= 0.0 and y <= IN_Y * 0.5:
+        return math.hypot(y - IN_Y, z)
+    if x >= OUT_X * 0.99 and y >= 0.0:
+        return math.hypot(x - OUT_X, z)
+    return math.hypot(math.hypot(x, y) - ARC_R, z)
+
+
 # ── 검출 · 판정 (son 모듈을 그대로 쓴다) ─────────────────────────────
 # 🚨 예전 이 시연은 **아크 2초가 지나면 무조건** 결함을 숨기고 비드를 띄웠다.
 #    그건 CLAUDE.md 가 경고한 **자기충족 검증**이다 — 성공률이 항상 100% 다.
@@ -1317,13 +1398,38 @@ HOLE_DARK_FRAC = 0.12
 HOLE_MIN_PX = max(60, 300 * CAM_AREA_SCALE)   # 해상도 따라 같이 줄인다
 # 이 비율을 넘는 어두운 덩어리는 벽면 구멍이 아니라 **관 저 끝**으로 본다.
 HOLE_MAX_FRAC = float(os.environ.get("HOLE_MAX_FRAC", 0.10))
+HOLE_WALL_NEAR_M = 0.25     # 덩어리 **둘레**가 이보다 가까워야 벽면 구멍이다
+
+
+def _near_wall_around(lab, i, st, depth):
+    """덩어리 둘레가 가까운 벽인가 — 벽면 구멍의 물리적 정의로 거른다.
+
+    벽면 구멍은 뚫린 **안쪽만 멀고 둘레는 벽**(가깝다). 관 저 끝 조각은
+    둘레도 멀다. 곡관 근처에서 저 끝이 화면 왼쪽으로 밀려 중앙 제외를
+    비껴가고 크기 상한(10%)도 통과하는 사례가 실측으로 확인됐다 —
+    9,685px(1%) 조각이 목표가 되어 시계각이 -50° 오염, 74.21mm 빗나감.
+    정답을 안 보는 순수 기하 판별이라 주행·정렬 목표에 써도 된다.
+    """
+    z = np.asarray(depth)
+    if z.ndim != 2 or z.shape != lab.shape:
+        return True                     # 깊이를 못 쓰면 기존 동작 유지
+    x0, y0 = int(st[i, cv2.CC_STAT_LEFT]), int(st[i, cv2.CC_STAT_TOP])
+    ww, hh = int(st[i, cv2.CC_STAT_WIDTH]), int(st[i, cv2.CC_STAT_HEIGHT])
+    m = max(6, int(0.5 * math.sqrt(float(st[i, cv2.CC_STAT_AREA]))))
+    ys, ye = max(0, y0 - m), min(lab.shape[0], y0 + hh + m)
+    xs, xe = max(0, x0 - m), min(lab.shape[1], x0 + ww + m)
+    ring = z[ys:ye, xs:xe][lab[ys:ye, xs:xe] != i]
+    ring = ring[np.isfinite(ring) & (ring > 0)]
+    if ring.size < 30:
+        return True
+    return float(np.median(ring)) < HOLE_WALL_NEAR_M
 # 비드 색 검출 — 관 벽(회색)·관 저 끝(검정)은 채도 0 이라 안 걸린다.
 BEAD_SAT_MIN = 60      # HSV 채도 하한 (0~255)
 BEAD_VAL_MIN = 40      # 너무 어두우면 색이 무의미
 BEAD_MIN_PX = max(20, 100 * CAM_AREA_SCALE)
 
 
-def find_wall_hole(rgb, expect_px=None):
+def find_wall_hole(rgb, expect_px=None, depth=None):
     """근접 벽면의 구멍을 찾는다 → dict 또는 None.
 
     🚨 **전방 개구부(관 저 끝)를 반드시 걸러야 한다.** 예전에는 "화면 중앙
@@ -1373,6 +1479,9 @@ def find_wall_hole(rgb, expect_px=None):
             continue
         area = int(st[i, cv2.CC_STAT_AREA])
         if area < HOLE_MIN_PX or area > big:
+            continue
+        # 🔑 둘레 깊이 판별 — 관 저 끝 조각(둘레도 멀다)을 거른다
+        if depth is not None and not _near_wall_around(lab, i, st, depth):
             continue
         if best is None or area > best["area_px"]:
             best = {"area_px": area, "cx": float(ce[i][0]),
@@ -1560,8 +1669,8 @@ def scan_hole():
        이미 매 스텝 렌더하므로 2프레임이면 최신 영상이고, 헤드리스는 렌더가
        아예 없으므로 파이프라인을 채울 만큼만(8) 굽는다.
     """
-    rgb, _ = front_frames(warm=SCAN_WARM)
-    return None if rgb is None else find_wall_hole(rgb)
+    rgb, z = front_frames(warm=SCAN_WARM)
+    return None if rgb is None else find_wall_hole(rgb, depth=z)
 
 
 def inspect_defect(tag):
@@ -1591,7 +1700,7 @@ def inspect_defect(tag):
         print(f"  [검출] {tag}: 결함이 전방 카메라 화각 밖")
         return cond, None, None
     g = defect_geom
-    hole = find_wall_hole(rgb, expect_px=px)
+    hole = find_wall_hole(rgb, expect_px=px, depth=z)
     bead = find_weld_bead(rgb, expect_px=px)
     # 🔑 **정답과 대조하기 전의 원 검출**을 따로 남긴다. `matched` 는 판정용
     #    교차확인이고, 주행·정렬 목표는 정답을 안 본 이 값에서 나와야 한다.
@@ -1759,6 +1868,8 @@ INSPECT_BACK_MM = 120.0     # (참고용) 설계상 촬영 정지 거리
 #    근거가 원래 이것이다(0.30 m/s 면 프레임당 30mm 라 결함 38mm 를 1.3
 #    프레임에만 잡아 놓친다). 정지 시점을 이 훑기가 정한다.
 SCAN_EVERY = max(1, int(PHYSICS_HZ / 10))
+REMEASURE_CLOCK_TOL_DEG = 15.0  # APPROACH 재측정 채택 한계 — 기존 목표 대비
+                                # 시계각이 이보다 튀면 근접 경사 오염으로 기각
 SCAN_WARM = 8 if HEADLESS else 2         # scan_hole 워밍업 프레임 (위 주석 참조)
 # 🚨 시각 물 층이 켜져 있으면 **스캔도 워밍업을 늘려야 한다.** front_frames 가
 #    물을 감추고 렌더를 굽는데, 2프레임으로는 감춘 것이 화면에 반영되기 전에
@@ -1792,6 +1903,10 @@ det_clock = None    # 시계각 (deg, +Z 에서 +Y 로. DEF_XF 와 같은 규약
 best_hole_px = 0    # 지금까지 본 가장 큰 구멍 면적 (px)
 first_hole_px = 0   # 최초 검출 면적 — 갱신 효과를 로그로 보이려고 남긴다
 first_det_x = None  # 최초 검출 축 위치
+retreat_x = 0.0     # RETREAT 목표 링 x (촬영 거리 확보용 후진)
+retreated = False   # 촬영 거리 후진을 이미 했는가 (임무당 1회)
+inspect_retry = 0   # 후진 후 INSPECT 실패 → 전진 재탐색 횟수 (최대 1회)
+_rej_px = 0         # 시계각 급변으로 기각한 재측정의 최대 면적 (로그 중복 방지)
 
 
 # ── Stop → Play 로 다시 돌리기 ──────────────────────────────────────
@@ -1812,7 +1927,8 @@ def restart_demo():
     global pre_hole, det_x, det_clock, last_raw_hole
     weld_ok, pre_hole = None, None
     det_x, det_clock, last_raw_hole = None, None, None
-    globals().update(best_hole_px=0, first_hole_px=0, first_det_x=None)
+    globals().update(best_hole_px=0, first_hole_px=0, first_det_x=None,
+                     _rej_px=0, retreated=False, inspect_retry=0)
     UsdGeom.Imageable(defect_mesh).MakeVisible()
     UsdGeom.Imageable(bead_mesh).MakeInvisible()
     _bead_op.Set(DEF_XF)
@@ -1828,6 +1944,7 @@ def restart_demo():
     inspected, repos_from, log = False, None, []
     globals()['inspect_fwd_mm'] = 0.0
     print("=" * 78)
+    globals()["_ros_prev_state"] = None
     print("[재시작] Stop → Play 감지 — 원위치 복귀 후 처음부터 다시 돈다")
     print("-" * 78)
 
@@ -1868,6 +1985,7 @@ print("-" * 78)
 # 헤드리스는 타임라인 조작이 없으므로 예전처럼 STEPS 만큼 돌고 끝난다.
 REPLAY = HOLD and not HEADLESS
 step, was_playing, reported = 0, True, False
+_ros_prev_state = None       # 상태 전이를 사건으로 내기 위한 직전 값
 while True:
     world.step(render=not HEADLESS)
     step += 1
@@ -1884,6 +2002,71 @@ while True:
             break
         if not _playing:
             continue          # 정지 중에는 FSM 을 진행하지 않는다
+
+    # 🚨 **DONE 검사보다 앞에 둔다.** 아래 `if state == "DONE": ... continue`
+    #    가 나머지를 통째로 건너뛰므로, 뒤에 두면 **시퀀스가 끝나는 순간
+    #    발행이 멈춘다** — `--hold` 로 창을 열어 두고 보고 있으면 화면이
+    #    그대로 굳는다(실측으로 걸렸다). 지령 수신(`bridge.spin()`)도 같이
+    #    죽어서 STOP 을 보내도 안 먹는다.
+    # ── ROS 발행 (10Hz) — FSM 을 건드리지 않고 관찰만 한다 ──────────
+    if bridge:
+        if state != _ros_prev_state:
+            # 🔑 상태 전이는 **1회성 사건**으로 따로 낸다. 10Hz 표본 사이에
+            #    지나간 상태는 통째로 사라진다(규격서 §7.2).
+            # REPOSITION 진입 = 용접이 끝나 검증하러 물러나는 시점이다.
+            # (EV_HOME 은 '출발점 복귀' 라 여기 쓰면 뜻이 어긋난다)
+            _ev = {"INSPECT": contract.EV_DEFECT,
+                   "ARC": contract.EV_WELD_BEGIN,
+                   "REPOSITION": contract.EV_WELD_DONE,
+                   "DONE": contract.EV_DONE}.get(state)
+            if state == "APPROACH" and _ros_prev_state == "SETTLE":
+                _ev = contract.EV_START
+            if _ev:
+                # 용접 사건에는 결함의 3D 좌표(호길이·시계각)를 싣는다 —
+                # 웹 3D 맵이 노란 스티커를 관 벽면에 붙인다. event 의
+                # **extra 필드라 규약 변경이 아니다.
+                # 🚨 측정값(det_*)이 아니라 **팁이 실제로 선 자리**를 싣는다.
+                #    APPROACH 말기의 비스듬한 재측정이 det_* 를 오염시킨
+                #    실측 사례(정답 180° 인데 109.4°)가 있다. Isaac 의 비드가
+                #    "지진 자리"에 보이듯 웹 스티커도 그래야 한다.
+                if _ev == contract.EV_WELD_BEGIN and not NO_TORCH:
+                    _tw = tip_end_world()
+                    _weld_spot = (
+                        round(pipe_s(_tw) * 1000, 1),
+                        round(math.degrees(math.atan2(
+                            _tw[1] - IN_Y, _tw[2])) % 360.0, 1))
+                _extra = {}
+                if _ev in (contract.EV_WELD_BEGIN, contract.EV_WELD_DONE):
+                    if _weld_spot is not None:
+                        _extra = {"defect_s_mm": _weld_spot[0],
+                                  "clock_deg": _weld_spot[1]}
+                    elif det_x is not None and det_clock is not None:
+                        # 토치 없는 시연(--no-torch) — 측정값이라도 싣는다
+                        _extra = {"defect_s_mm":
+                                  round(pipe_s((det_x, IN_Y)) * 1000, 1),
+                                  "clock_deg": round(det_clock % 360.0, 1)}
+                bridge.robot(ROS_NS).emit(
+                    _ev, f"{_ros_prev_state} → {state}",
+                    pipe_s(wpos(_seg1)) * 1000, **_extra)
+            _ros_prev_state = state
+        if step % _ROS_EVERY == 0:
+            _p = wpos(_seg1)
+            _s, _off = pipe_s(_p), pipe_off(_p)
+            _rp = bridge.robot(ROS_NS)
+            _rp.publish_state(
+                state=_ST.get(state, contract.STATE_RUN), direction=1,
+                speed_mps=TARGET_SPEED_MPS, s_mm=_s * 1000,
+                s_total_mm=PIPE_S_TOTAL * 1000, off_mm=_off * 1000,
+                lap=0, stuck=0, step=step,
+                roll_deg=math.degrees(math.atan2(_p[2], _p[1] - IN_Y)),
+                reason=state, art=art, wheel_idx=wheel_idx, pos=_p)
+            _rp.publish_camera()
+            while (_cmd := _rp.pop_mission()) is not None:
+                print(f"[ROS] 📥 지령 {_cmd.get('cmd')} "
+                      f"{_cmd.get('reason', '')}  (이 시연은 시퀀스를 "
+                      f"끝까지 돌리므로 기록만 한다)")
+        # 🚨 매 스텝. 안 부르면 지령을 아예 못 받는다.
+        bridge.spin()
 
     if state == "DONE":
         if not reported:
@@ -1976,17 +2159,31 @@ while True:
             else:
                 _tg = hole_target(last_raw_hole)
             if _tg is None:
-                # 🚨 정답으로 대신하지 않는다(CLAUDE.md: 감지 실패 시 정답
-                #    fallback 금지). 못 찾았으면 못 고치는 것이고, 그대로 보고한다.
-                print("  ⚠ 구멍을 못 찾았다 — 수리 목표를 세울 수 없다. "
-                      "정답 좌표로 대신하지 않는다(임무 규칙 7: 인지·보고가 성공)")
-                state, t_state = "RESUME", 0
+                if retreated and inspect_retry == 0:
+                    # 확보한 거리에서는 구멍이 임계 미달로 안 보일 수 있다
+                    # (실측: 후진 후 검출 실패 → 임무가 통째로 넘어갔다).
+                    # 전진하며 다시 찾는다 — 두 번째 검출은 후진 없이 그
+                    # 자리에서 바로 촬영한다(retreated 가 이미 True).
+                    inspect_retry = 1
+                    inspected = False
+                    print("  ⚠ 확보 거리에서 구멍이 안 보인다 — 전진 재탐색 "
+                          "(다음 검출 지점에서 바로 촬영)")
+                    state, t_state = "APPROACH", 0
+                else:
+                    # 🚨 정답으로 대신하지 않는다(CLAUDE.md: 감지 실패 시 정답
+                    #    fallback 금지). 못 찾았으면 못 고치는 것이고, 그대로
+                    #    보고한다.
+                    print("  ⚠ 구멍을 못 찾았다 — 수리 목표를 세울 수 없다. "
+                          "정답 좌표로 대신하지 않는다(임무 규칙 7: 인지·보고가 "
+                          "성공)")
+                    state, t_state = "RESUME", 0
             else:
                 det_x, det_clock, inspect_fwd_mm = _tg
                 # APPROACH 가 더 정면인 관측으로 갱신할 수 있게 기준을 남긴다.
                 first_det_x, first_hole_px = det_x, (pre_hole or {}).get(
                     "area_px", 0)
                 best_hole_px = first_hole_px
+                _rej_px = 0
                 _ex = (det_x - DEFECT_X) * 1000.0
                 _ec = ((det_clock - DEFECT_CLOCK_DEG + 180.0) % 360.0) - 180.0
                 print(f"  [목표] {'⚠ **정답** 결함 위치' if KNOWN_DEFECT else '**카메라가 정한** 결함 위치'} "
@@ -2016,12 +2213,29 @@ while True:
                           f"x={ring[0] * 1000:.1f}mm 에서 정지 "
                           f"(결함 {INSPECT_BACK_MM:.0f}mm 앞). 카메라 검출 아님")
                     state, t_state = "INSPECT", 0
-            elif t_state % SCAN_EVERY == 0 and scan_hole() is not None:
+            elif t_state % SCAN_EVERY == 0 and \
+                    (_h0 := scan_hole()) is not None:
                 inspected = True
                 drive(0.0)
                 print(f"[탐지] 벽면 구멍 발견 — 링 x={ring[0] * 1000:.1f}mm "
                       f"에서 정지. 위치는 카메라가 정한다")
-                state, t_state = "INSPECT", 0
+                # 🔑 설계 촬영 거리(INSPECT_BACK_MM)보다 가까우면 되물러난다.
+                #    물리가 느리면 스캔이 실거리 기준으로 듬성해져 정지가
+                #    늦는데(실측 70.7mm, 목표 120mm), 근접 경사 관측은
+                #    시계각을 크게 틀리게 한다(실측 초기 오차 -50.31°).
+                _tg0 = hole_target(_h0)
+                _fwd0 = None if _tg0 is None else _tg0[2]
+                if (_fwd0 is not None and _fwd0 < INSPECT_BACK_MM - 5.0
+                        and not retreated):
+                    retreated = True     # 임무당 1회 — 확보 거리에서 안 보이면
+                                         # INSPECT 가 전진 재탐색으로 돌려보낸다
+                    retreat_x = ring[0] - (INSPECT_BACK_MM - _fwd0) * MM
+                    print(f"[탐지] 촬영 거리 {_fwd0:.1f}mm < 설계 "
+                          f"{INSPECT_BACK_MM:.0f}mm — "
+                          f"{INSPECT_BACK_MM - _fwd0:.1f}mm 후진해 확보한다")
+                    state, t_state = "RETREAT", 0
+                else:
+                    state, t_state = "INSPECT", 0
             elif path_s(*wpos(_seg1)[:2]) > S_IN + S_ARC + 0.25:
                 print("[END_REACHED] 코스 끝까지 결함을 못 봤다 — 보고하고 끝낸다")
                 state, t_state = "DONE", 0
@@ -2048,8 +2262,22 @@ while True:
                 # 관 축 방향으로 앞쪽(아직 안 지나친 것)만 받는다 — 지나친 뒤의
                 # 검출은 뒤통수를 보는 것이라 기하가 성립하지 않는다.
                 if _tg2 is not None and _tg2[0] > ring[0]:
-                    best_hole_px = _h["area_px"]
-                    det_x, det_clock, inspect_fwd_mm = _tg2
+                    _dclk = ((_tg2[1] - det_clock + 180.0) % 360.0) - 180.0
+                    if abs(_dclk) > REMEASURE_CLOCK_TOL_DEG:
+                        # 🚨 시계각이 튀는 재측정은 **비스듬한 근접 관측의
+                        #    오염**이다 — 실측: 초기 목표가 109.4° 로 끌려가
+                        #    74.21mm 빗나갔다. 면적이 최대여도 기각한다.
+                        #    (INSPECT 초기값이 기준이므로, 초기값의 정확도는
+                        #    RETREAT 의 촬영 거리 확보가 담보한다)
+                        if _h["area_px"] > _rej_px:
+                            _rej_px = _h["area_px"]
+                            print(f"  [재측정 기각] 면적 {_h['area_px']:,}px "
+                                  f"최대지만 시계각 {det_clock:+.1f}° → "
+                                  f"{_tg2[1]:+.1f}° ({_dclk:+.1f}°) 급변 — "
+                                  f"채택 안 함")
+                    else:
+                        best_hole_px = _h["area_px"]
+                        det_x, det_clock, inspect_fwd_mm = _tg2
         elif t_state % 400 == 0:
             q = np.asarray(art.get_joint_positions(), dtype=float)
             v = np.asarray(art.get_joint_velocities(), dtype=float)
@@ -2064,6 +2292,21 @@ while True:
                   f"  (지령 {SPIN_DEG_S:.0f})  휠각 {wq.min():7.1f}~{wq.max():7.1f}"
                   f"  피스톤 {min(pis):4.1f}~{max(pis):4.1f}"
                   f"  벨로우즈 {min(bel):+5.1f}~{max(bel):+5.1f}{tj}")
+
+    elif state == "RETREAT":
+        # 촬영 거리 회복 — 검출이 늦어 결함에 너무 가깝다. 저속 후진해
+        # 설계 촬영 거리(INSPECT_BACK_MM)에서 INSPECT 로 간다.
+        if ring[0] <= retreat_x or t_state > 8 * PHYSICS_HZ:
+            drive(0.0)
+            if t_state > 8 * PHYSICS_HZ:
+                print(f"[RETREAT] ⚠ 시간 초과 — 링 x={ring[0] * 1000:.1f}mm "
+                      f"에서 그대로 촬영한다")
+            else:
+                print(f"[RETREAT] 후진 완료 — 링 x={ring[0] * 1000:.1f}mm "
+                      f"(목표 {retreat_x * 1000:.1f}mm)")
+            state, t_state = "INSPECT", 0
+        else:
+            drive(-0.5 * SPIN_DEG_S)
 
     elif state == "ALIGN":
         # 🚨 J1(원주 회전)만 맞추면 **축방향이 안 맞는다.** APPROACH 는

@@ -6,7 +6,9 @@
   --floor2 (기본)  진입 → 곡관 → 결함 2건 수리·검증 → **관 단절 감지 → 복귀**
   --floor1          진입 → 곡관 → **T자 분기 판단(오른손 법칙)**
 
-맵  maps/restroom_pipe150_final.usd  (CATIA STEP 변환본, MAP_USD 로 교체 가능)
+맵  isaacpjt/dongmin/graphic_file/assets/pipe/restroom_pipeR150.usd
+    (restroom_pipeR150.stp 를 tools/step_to_usd.py 로 변환. MAP_USD 로 교체 가능.
+     floor2/floor1/aisle 모두 들어 있고 층 z 도 옛 맵과 같다 — 스캔 실측 2026-08-07)
     🚨 **이 파일은 읽기 전용으로 다룬다.** Isaac 에서 Ctrl+S 하면 형상 없는
        껍데기가 원본을 덮어써 실제로 한 번 날아갔다(기록된 사고).
 
@@ -31,12 +33,10 @@
    `SetInstanceable(False)` 를 해야 메시 편집(관통 개구 절단)과 콜라이더 부여가
    된다. 실측으로 확인: 해제 후 Mesh 15개 노출, 삼각형 편집·cook 전부 통과.
 
-━━ 이 맵에서 **미리 알고 시작하는 두 가지 제약** (실측, 추측 아님) ━━
-① floor2 경로 s 960~1660mm 구간이 **ø90(내반경 45)** 이다. 메모리의 "관R 45
-   곡관 2 + 직관 1(x 830~1050, y 1250~1400)" 이 그것이고 **우회로가 없다.**
-   휠 접지 반경이 40→35mm 로 들어가야 해서 피스톤이 5mm 더 압축된다
-   (스트로크 0~10mm 라 여지는 있으나 예압이 레그당 +15N). 통과 여부는 실행으로만
-   가린다 — `[관경]` 로그가 매 구간 벽거리를 찍는다.
+━━ 옛 맵(restroom_pipe150_final)에서 알고 시작했던 제약 (실측, 추측 아님) ━━
+① (해소) floor2 s 960~1660mm 의 **ø90 구간은 새 CAD 에 없다** — 2026-08-07
+   restroom_pipeR150 변환본 실측: `[관경]` 스캔 전 구간 ø100. 좁은 중복
+   사본(45.3mm)도 안 잡혔다. 옛 맵을 MAP_USD 로 되돌리면 이 제약이 부활한다.
 ② floor1 의 T 분기는 **날카로운 T 다(필렛 없음).** 실측: x 550~680 에서 ±Y 가
    50.0mm 로 막혀 있다가 x≈700 에서 갑자기 열리고 x=730 에서 +X 가 50.0 로 막힌다.
    급회전 90° 는 두 세그먼트가 **동시에** 90° 를 이뤄야 하는데 벨로우즈는 4관절
@@ -50,6 +50,7 @@
   isaac_python real_map_demo.py --floor2 --headless
   DISPLAY=:1 isaac_python real_map_demo.py --floor2 --glass --hold
   DISPLAY=:1 isaac_python real_map_demo.py --floor1 --hold --shots
+  isaac_ros; isaac_python real_map_demo.py --floor2 --ros   # 웹 패널 연동
 """
 
 import json
@@ -75,6 +76,10 @@ if FLUID and WATER:
 STEPS = 60000
 if "--steps" in sys.argv:
     STEPS = int(sys.argv[sys.argv.index("--steps") + 1])
+# --ros: 규약(`src/dongmin/pipe_comm/pipe_comm/contract.py`)대로 ROS 2 로
+#        상태·카메라를 발행한다. repair_demo 와 같은 브리지(ros_bridge.py)다.
+ROS = "--ros" in sys.argv
+ROS_NS = os.environ.get("ROS_NS", "robot")
 
 from isaacsim import SimulationApp                        # noqa: E402
 
@@ -92,22 +97,25 @@ MM = 0.001
 PHYSICS_HZ_PRE = float(os.environ.get("PHYSICS_HZ", 240))
 SON = _P(__file__).resolve().parent
 ROBOT_USDA = str(SON / "robot_bellows" / "robot_bellows.usda")
-# 🔑 **수정본을 기본으로 쓴다.** 원본 CAD 에는 로봇이 못 지나는 기하 결함이
-#    둘 있다 — ① 같은 배관이 두 번 모델링됐고 `PartBody` 사본이 4.7mm 더 좁다
-#    (곡관2 에서 45.3mm) ② floor2 의 y=1400 가지가 ø90 이다. 둘 다
-#    `tools/fix_map.py` 가 고친다(원본은 안 건드리고 `_fixed.usd` 를 만든다).
-#    실측: 최악 내반경 44.6 → 48.8mm (기준 배관 pipe_elbow_lr150 과 동일).
-#    맵은 `src/son/maps/` 안에 둔다(2026-08-06 사용자 지시 — 레포 밖 참조 제거).
+# 🔑 **restroom_pipeR150 변환본을 기본으로 쓴다** (2026-08-07 사용자 지시).
+#    restroom_pipeR150.stp → tools/step_to_usd.py 로 구운 floor2 전용 맵이다.
+#    옛 맵(restroom_pipe150_final)의 기하 결함 — ① 같은 배관의 좁은 중복
+#    사본(곡관2 에서 45.3mm) ② floor2 의 y=1400 가지 ø90 — 이 새 CAD 에서
+#    고쳐졌는지는 **실행이 가린다**: SETTLE 의 휠 밀착 로그와 주행 중 `관 xx.xmm`
+#    로그가 매 구간 내반경을 찍는다. 좁은 사본이 남아 있으면 tools/fix_map.py
+#    방식의 수정을 이 맵에도 얹어야 한다.
 #    ⚠ `.gitignore` 의 `*.usd` 때문에 **git 으로는 안 따라간다** — 받는 사람은
-#    STEP 을 변환해 `maps/` 에 넣고 `tools/fix_map.py` 를 직접 돌려야 한다.
-_MAPS = SON / "maps"
-_MAP_FIXED = _MAPS / "restroom_pipe150_final_fixed.usd"
-_MAP_ORIG = _MAPS / "restroom_pipe150_final.usd"
-MAP_USD = os.environ.get(
-    "MAP_USD", str(_MAP_FIXED if _MAP_FIXED.is_file() else _MAP_ORIG))
-if MAP_USD == str(_MAP_ORIG):
-    print("[경고] 원본 맵을 쓴다 — 곡관에 좁은 중복 사본(45.3mm)과 ø90 구간이 "
-          "있어 로봇이 못 지난다. `python3 tools/fix_map.py` 를 먼저 돌릴 것")
+#    같은 자리의 .stp 를 변환해 직접 만들어야 한다.
+_WS = SON.parents[1]
+_MAP_NEW = (_WS / "isaacpjt" / "dongmin" / "graphic_file" / "assets" / "pipe"
+            / "restroom_pipeR150.usd")
+MAP_USD = os.environ.get("MAP_USD", str(_MAP_NEW))
+if not _P(MAP_USD).is_file():
+    raise SystemExit(
+        f"[중단] 맵이 없다 — {MAP_USD}\n"
+        "  restroom_pipeR150.stp 를 변환할 것: isaac_python "
+        "src/son/tools/step_to_usd.py restroom_pipeR150.stp "
+        "isaacpjt/dongmin/graphic_file/assets/pipe/restroom_pipeR150.usd")
 OUT = SON / "out" / f"real_map_{FLOOR}"
 
 META = json.loads((SON / "spec" / "parts_meta.json").read_text())
@@ -1178,6 +1186,45 @@ except Exception as exc:
     print(f"[경고] 카메라 초기화 실패 — 검출·판정 불가 ({exc})")
     rigs = []
 
+# ── ROS 2 브리지 (--ros 일 때만) — repair_demo 와 같은 접붙임 자리다 ──
+# 🔑 카메라·annotator 가 이미 만들어졌고(`rigs`) `world.reset()` 도 지났다
+#    (규격서 §8.2 의 순서 제약). annotator 는 **다시 붙이지 않고** 그대로 쓴다.
+bridge = None
+if ROS:
+    # 🔑 발행자는 규약 옆 — src/dongmin/isaac_bridge (2026-08-08 이동)
+    sys.path.insert(0, str(SON.parent / "dongmin" / "isaac_bridge"))
+    import ros_bridge                                     # noqa: E402
+    if not ros_bridge.available():
+        raise SystemExit("[중단] --ros 인데 rclpy/규약을 못 쓴다. "
+                         "`isaac_ros` 를 먼저 실행할 것")
+    from pipe_comm import contract                        # noqa: E402
+    bridge = ros_bridge.Bridge([ROS_NS])
+    _rp = bridge.robot(ROS_NS)
+    for _nm, _ann, _dep in rigs:
+        if _nm == "front_camera":
+            _rp.use_annotators(_ann, _dep, CAM_W, CAM_H, F_PX)
+    print(f"[ROS] 전방 카메라 annotator {len(_rp.cams)}개 연결")
+    _ROS_EVERY = max(1, int(PHYSICS_HZ / 10))     # 10Hz
+    _ros_prev_state = None
+    _weld_spot = None         # 용접 순간 팁이 실제로 선 자리 (s_mm, clock_deg)
+    # real_map FSM → 규약 상태값. 규약이 더 넓으므로 여기서 좁혀 준다.
+    # 🚨 repair_demo 와 상태 이름이 다르다 — CRUISE(주행) / RECOVER(끼임 후진)
+    #    / JUNCTION(분기 진입 시도) / DISCONNECTED(정지·보고) / RETURN(복귀).
+    _ST = {
+        "SETTLE": contract.STATE_SETTLE,
+        "CRUISE": contract.STATE_RUN, "RESUME": contract.STATE_RUN,
+        "JUNCTION": contract.STATE_RUN,
+        "INSPECT": contract.STATE_INSPECT, "VERIFY": contract.STATE_INSPECT,
+        "ALIGN": contract.STATE_REPAIR, "EXTEND": contract.STATE_REPAIR,
+        "ARC": contract.STATE_REPAIR, "COOL": contract.STATE_REPAIR,
+        "RECOVER": contract.STATE_STUCK,
+        "REPOSITION": contract.STATE_RETURN, "RETURN": contract.STATE_RETURN,
+        "DISCONNECTED": contract.STATE_HOLD,
+        "DONE": contract.STATE_DONE,
+    }
+    # 후진하는 상태 — direction 을 여기서 뽑는다 (속도는 항상 양수로 싣는다)
+    _REVERSING = ("REPOSITION", "RECOVER", "RETURN")
+
 sys.path.insert(0, str(SON))
 from condition.detector import PipeConditionDetector      # noqa: E402
 from welder.weld import WeldSequencer                     # noqa: E402
@@ -1652,6 +1699,9 @@ print("-" * 78)
 REPLAY = HOLD and not HEADLESS
 _spark_cyl = None       # 스파크 가둠 캐시 (결함 s, 가둠 함수)
 step, was_playing, reported = 0, True, False
+# 🔑 루프 본문(1742)보다 먼저 ROS 블록이 s_of() 를 부른다 — s_of 는 전역
+#    s_hint 를 기본 hint 로 쓰므로 첫 스텝 전에 값이 있어야 한다.
+s_hint = START_S_MM * MM
 
 
 def report():
@@ -1712,6 +1762,82 @@ while True:
             break
         if not _playing:
             continue
+
+    # 🚨 **DONE 검사보다 앞에 둔다** (repair_demo 와 같은 이유) — 뒤에 두면
+    #    시퀀스가 끝나는 순간 발행·지령 수신(`bridge.spin()`)이 통째로 멈춘다.
+    # ── ROS 발행 (10Hz) — FSM 을 건드리지 않고 관찰만 한다 ──────────
+    if bridge:
+        if state != _ros_prev_state:
+            # 🔑 상태 전이는 **1회성 사건**으로 따로 낸다 (규격서 §7.2).
+            _ev = {"INSPECT": contract.EV_DEFECT,
+                   "ARC": contract.EV_WELD_BEGIN,
+                   "REPOSITION": contract.EV_WELD_DONE,
+                   "RECOVER": contract.EV_STUCK,
+                   "JUNCTION": contract.EV_BRANCH,
+                   "DISCONNECTED": contract.EV_DISCONNECT}.get(state)
+            if state == "CRUISE" and _ros_prev_state == "SETTLE":
+                _ev = contract.EV_START
+            if state == "DONE":
+                # 복귀 완주면 HOME, 코스 끝 도달이면 ARRIVE, 그 밖은 DONE
+                _ev = (contract.EV_HOME if _ros_prev_state == "RETURN"
+                       else contract.EV_ARRIVE
+                       if end_reason and "코스 끝" in end_reason
+                       else contract.EV_DONE)
+            if _ev:
+                # 용접 사건에는 결함의 3D 좌표(호길이·시계각)를 싣는다 —
+                # 웹 3D 맵이 노란 스티커를 관 벽면에 붙인다 (extra 필드).
+                # 🚨 측정값이 아니라 **팁이 실제로 선 자리**를 싣는다
+                #    (repair_demo 의 실측 교훈 그대로).
+                if _ev == contract.EV_WELD_BEGIN and not NO_TORCH:
+                    _tw = tip_end_world()
+                    _ts, _ = PATH.project(_tw, s_hint)
+                    _tc, _tt = PATH.point_tangent(_ts)
+                    _tv = _tw - _tc
+                    _tv = _tv - _tt * np.dot(_tv, _tt)
+                    _tn = float(np.linalg.norm(_tv))
+                    _weld_spot = (
+                        round(_ts * 1000, 1),
+                        round((PATH.clock_of(_ts, _tv / _tn) if _tn > 1e-9
+                               else (d_cur["clock"] if d_cur else 180.0))
+                              % 360.0, 1))
+                _extra = {}
+                if _ev in (contract.EV_WELD_BEGIN, contract.EV_WELD_DONE):
+                    if _weld_spot is not None:
+                        _extra = {"defect_s_mm": _weld_spot[0],
+                                  "clock_deg": _weld_spot[1]}
+                    elif d_cur is not None:
+                        # 토치 없는 시연(--no-torch) — 설계 좌표라도 싣는다
+                        _extra = {"defect_s_mm": round(d_cur["s"] * 1000, 1),
+                                  "clock_deg": round(d_cur["clock"] % 360.0, 1)}
+                bridge.robot(ROS_NS).emit(
+                    _ev, f"{_ros_prev_state} → {state}",
+                    s_of(_seg1, s_hint) * 1000, **_extra)
+            _ros_prev_state = state
+        if step % _ROS_EVERY == 0:
+            _p = wpos(_seg1)
+            _s, _off = PATH.project(_p, s_hint)
+            # 롤 = 몸통 중심이 중심선에서 밀린 방향의 시계각. 바닥 안착이면
+            # ≈180°(규약: 180=바닥) — repair_demo 와 같은 근사다.
+            _c, _t = PATH.point_tangent(_s)
+            _dv = _p - _c
+            _dv = _dv - _t * np.dot(_dv, _t)
+            _n = float(np.linalg.norm(_dv))
+            _rp = bridge.robot(ROS_NS)
+            _rp.publish_state(
+                state=_ST.get(state, contract.STATE_RUN),
+                direction=-1 if state in _REVERSING else 1,
+                speed_mps=TARGET_SPEED_MPS, s_mm=_s * 1000,
+                s_total_mm=PATH.total * 1000, off_mm=_off * 1000,
+                lap=0, stuck=stuck_retry, step=step,
+                roll_deg=(PATH.clock_of(_s, _dv / _n) if _n > 1e-6 else 180.0),
+                reason=state, art=art, wheel_idx=wheel_idx, pos=_p)
+            _rp.publish_camera()
+            while (_cmd := _rp.pop_mission()) is not None:
+                print(f"[ROS] 📥 지령 {_cmd.get('cmd')} "
+                      f"{_cmd.get('reason', '')}  (이 시연은 시퀀스를 "
+                      f"끝까지 돌리므로 기록만 한다)")
+        # 🚨 매 스텝. 안 부르면 지령을 아예 못 받는다.
+        bridge.spin()
 
     if state == "DONE":
         if not reported:
@@ -2172,6 +2298,8 @@ while True:
 
 if not reported:
     report()
+if bridge is not None:
+    bridge.shutdown()
 
 import threading                                          # noqa: E402
 

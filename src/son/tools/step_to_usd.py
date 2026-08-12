@@ -52,8 +52,14 @@ def main(src: str, dst: str) -> int:
     #    가 async). 그냥 부르면 아무 일도 안 하고 빈 경로가 나온다 — 실측으로
     #    `path=''` 만 받고 파일이 안 생겼다. Kit 의 루프에 얹고 **`app.update()`
     #    로 펌프**해야 실제로 변환된다.
+    # 🚨 tessLOD 를 반드시 올린다 (0~4, 기본 프리셋은 곡면이 성글다).
+    #    기본값으로 구우면 곡관 원주가 ~17각형이 되어 능선 깊이가 최대 1.8mm —
+    #    휠(반경 10mm, 예압)이 곡관 정중앙에서 능선에 걸려 슬립·끼임이 났다
+    #    (2026-08-07 restroom_pipeR150 실측: 옛 변환본 0.2mm vs 새 1.8mm).
+    #    "4"=kA3DTessLODExtraHigh. accurateTessellation 은 HOOPS SDK 버그로
+    #    확장이 강제로 꺼 두므로(OMPE-33813) 여기 넣어도 소용없다.
     from omni.kit.async_engine import run_coroutine
-    task = run_coroutine(conv.create_converter_task(src, dst, {}))
+    task = run_coroutine(conv.create_converter_task(src, dst, {"tessLOD": "4"}))
     for _ in range(60000):
         if task.done():
             break

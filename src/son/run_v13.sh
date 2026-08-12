@@ -18,16 +18,26 @@ set -e
 COURSE="${1:-both}"
 shift || true
 
-ISAAC=~/dev_ws/isaac_sim/isaacsim/_build/linux-x86_64/release
+# Isaac Sim 5.1 은 pip 설치본(venv)이다 — 옛 소스 빌드의 python.sh 는 없다.
+# 경로 규칙은 setup/env.sh 와 같다(ISAACSIM_VENV / ISAACSIM_ROOT).
+WS="$(cd "$(dirname "$0")/../.." && pwd)"
+ISAACSIM_VENV="${ISAACSIM_VENV:-$HOME/isaacsim_venv}"
+ISAAC="$ISAACSIM_VENV/lib/python3.11/site-packages/isaacsim"
+ISAAC_PY="$ISAACSIM_VENV/bin/python"
 HUMBLE="$ISAAC/exts/isaacsim.ros2.bridge/humble"
 
 # Isaac(3.11) 내장 rclpy — ROS 발행에 필요. 런처 환경변수로 줘야 로드된다.
 export LD_LIBRARY_PATH="$HUMBLE/lib:${LD_LIBRARY_PATH:-}"
-export PYTHONPATH="$HUMBLE/rclpy:${PYTHONPATH:-}"
+# 🚨 앞의 tools/isaac_autostream 은 setup/env.sh 의 `isaac_python` 과 같은 것 —
+#    SimulationApp 을 가로채 WebRTC 스트리밍을 켠다. 이 서버엔 X 디스플레이가
+#    없어서 이게 없으면 창을 만들려다 IWindowing 실패로 즉시 죽는다.
+#    끄려면 ISAAC_STREAM=0.
+export PYTHONPATH="$WS/tools/isaac_autostream:$HUMBLE/rclpy:${PYTHONPATH:-}"
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-143}"      # 팀 규격서 값
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export FASTRTPS_DEFAULT_PROFILES_FILE="${FASTRTPS_DEFAULT_PROFILES_FILE:-$HOME/.ros/fastdds_whitelist.xml}"
+export OMNI_KIT_ACCEPT_EULA=YES                   # 없으면 헤드리스에서 물어보다 멈춘다
 export PYTHONUNBUFFERED=1
-export DISPLAY="${DISPLAY:-:1}"
 
 cd "$(dirname "$0")"
 
@@ -43,5 +53,5 @@ case " $* " in
     ;;
 esac
 
-"$ISAAC/python.sh" real_map_demo_v1_3.py \
+"$ISAAC_PY" real_map_demo_v1_3.py \
      --course "$COURSE" --hold --steps 220000 "$@"

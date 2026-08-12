@@ -1795,9 +1795,14 @@ def build_robot(name, path_cl):
             (Gf.Matrix4d(1.0) if fwd else rot(180, (0, 0, 1)))
             * trans(hm_x, 0, 0))
         # 관 내부는 로봇 조명이 유일한 광원. 센서보다 4mm 앞, 광축 둘레 대칭.
+        # 🚨 restroom_final0807 맵은 관 내벽이 **흰색**이라 예전 값 4e5 로는
+        #    전방 화면이 통째로 하얗게 탄다(과노출). 800 실측(2026-08-11,
+        #    5e4 도 탔고 2e3 은 벽이 허옇다). 어두운 맵이면 FRONT_LIGHT 로
+        #    되올린다. 개구부로 새는 흰 줄무늬는 /World/Light (외부광)이다.
         for k in range(2):
             lg = UsdLux.SphereLight.Define(stage, f"{base}/light_{k}")
-            lg.CreateIntensityAttr(4.0e5)
+            lg.CreateIntensityAttr(
+                float(os.environ.get("FRONT_LIGHT", "800")))
             lg.CreateRadiusAttr(0.002)
             UsdGeom.Xformable(lg).AddTranslateOp().Set(Gf.Vec3d(
                 x + (0.004 if fwd else -0.004),
@@ -1817,6 +1822,43 @@ for _nm in RUN_NAMES:
     robots.append(build_robot(_nm, paths[_nm]))
 print(f"[준비] 로봇 {len(robots)}대 = {', '.join(r['name'] for r in robots)} "
       f"— 코스마다 한 대씩 동시에 굴린다")
+
+# ── 관로 붙박이 조명 — 코스 중심선을 따라 일정 간격으로 점광원을 심는다.
+#    🚨 기본 꺼짐: 광원 구슬이 카메라에 직접 보여 자동 노출이 흔들리고
+#    화면이 오히려 어두워졌다(2026-08-11 실측). 균일 조도는 아래
+#    DomeLight 가 맡는다. 켜려면 PIPE_LIGHT=<세기>, 간격 PIPE_LIGHT_MM.
+_PL = float(os.environ.get("PIPE_LIGHT", "0"))
+_PL_MM = float(os.environ.get("PIPE_LIGHT_MM", "250"))
+if _PL > 0:
+    _n_pl = 0
+    for r in robots:
+        _cl9 = r["cl"]
+        _next_s = 0.0
+        for _i9 in range(len(_cl9.p)):
+            # 🚨 cl.s 는 **미터**다 (총 4.088 등) — mm 로 알고 비교하면
+            #    조명이 첫 1개만 생긴다(실측).
+            if float(_cl9.s[_i9]) * 1000.0 < _next_s:
+                continue
+            _next_s = float(_cl9.s[_i9]) * 1000.0 + _PL_MM
+            _pl = UsdLux.SphereLight.Define(
+                stage, f"/World/pipe_lights/{r['name']}_{_n_pl}")
+            _pl.CreateIntensityAttr(_PL)
+            _pl.CreateRadiusAttr(0.004)
+            UsdGeom.Xformable(_pl).AddTranslateOp().Set(Gf.Vec3d(
+                float(_cl9.p[_i9][0]), float(_cl9.p[_i9][1]),
+                float(_cl9.p[_i9][2])))
+            _n_pl += 1
+    print(f"[준비] 💡 관로 조명 {_n_pl}개 — 코스 {_PL_MM:.0f}mm 간격, "
+          f"세기 {_PL:.0f} (PIPE_LIGHT/PIPE_LIGHT_MM)")
+
+# 균일 환경광(DomeLight) — 점광원과 달리 카메라에 광원이 안 보여 자동
+# 노출을 안 흔들고, 관 내부 조도가 고르다 (2026-08-11 사용자: 헤드라이트만
+# 으로는 밝기가 뒤죽박죽 → 400 실측 채택). 끄려면 DOME_LIGHT=0.
+_DM = float(os.environ.get("DOME_LIGHT", "400"))
+if _DM > 0:
+    _dm = UsdLux.DomeLight.Define(stage, "/World/ambient")
+    _dm.CreateIntensityAttr(_DM)
+    print(f"[준비] 💡 환경광 DomeLight 세기 {_DM:.0f} (DOME_LIGHT)")
 
 # ── 휠 토크 한계 덮어쓰기 ───────────────────────────────────────────
 # 🚨 **world.reset() 앞이어야 한다.** 시뮬이 시작된 뒤 USD 드라이브 속성을 쓰면

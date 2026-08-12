@@ -9,6 +9,4 @@ __pycache__/
 *.pth
 isaacpjt/dongmin/graphic_file/out/
 CLAUDE.md
-isaacsim_kb/
 .pytest_cache/
-docs/
